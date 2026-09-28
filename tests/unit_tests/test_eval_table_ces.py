@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import sys
-import types
 from dataclasses import replace
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, MagicMock
 
 import pytest
@@ -21,7 +20,28 @@ def run(mock_run):
 
 
 @pytest.fixture
-def mock_ces_client(monkeypatch):
+def coreweave_evaluations_module(monkeypatch):
+    client_module = ModuleType("coreweave_evaluations")
+    client_module.__path__ = []
+    client_module.Client = MagicMock
+
+    types_module = ModuleType("coreweave_evaluations.types")
+    types_module.__path__ = []
+    image_module = ModuleType("coreweave_evaluations.types.wandb_image_v1_param")
+    image_module.WandbImageV1Param = dict
+
+    monkeypatch.setitem(sys.modules, "coreweave_evaluations", client_module)
+    monkeypatch.setitem(sys.modules, "coreweave_evaluations.types", types_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "coreweave_evaluations.types.wandb_image_v1_param",
+        image_module,
+    )
+    return client_module
+
+
+@pytest.fixture
+def mock_ces_client(monkeypatch, coreweave_evaluations_module):
     client = MagicMock()
     client.eval_tables.create.return_value = SimpleNamespace(
         dataset_id="dataset-1",
@@ -42,9 +62,7 @@ def mock_ces_client(monkeypatch):
         "CES_BASE_URL",
         "https://evaluations.example.test",
     )
-    client_module = types.ModuleType("coreweave_evaluations")
-    client_module.Client = MagicMock
-    monkeypatch.setitem(sys.modules, "coreweave_evaluations", client_module)
+    monkeypatch.setattr(coreweave_evaluations_module, "Client", MagicMock)
     monkeypatch.setattr(
         "wandb.sdk.data_types.eval_table._writer_ces.CESWriter._resolve_scope_context",
         lambda self, bound_run: ces._CESScopeContext(
@@ -166,6 +184,24 @@ def test_ces_eval_table_stubs_media_until_native_support_exists(
     mock_wandb_log,
     run,
 ):
+    histogram = wandb.Histogram([1, 2, 3])
+    table = wandb.EvalTable(
+        columns=["histogram"],
+        data=[[histogram]],
+        backend="ces",
+    )
+
+    run.log({"media_eval": table})
+
+    rows = mock_ces_client.eval_tables.rows.add.call_args.kwargs["rows"]
+    assert rows[0]["output"]["histogram"] == "[wandb.Histogram not yet supported]"
+    mock_wandb_log.assert_warned("wandb.Histogram values are not yet supported")
+
+
+def test_ces_eval_table_writes_supported_media(
+    mock_ces_client,
+    run,
+):
     from PIL import Image as PILImage
 
     image = wandb.Image(PILImage.new("RGB", (2, 2), color="red"))
@@ -178,32 +214,63 @@ def test_ces_eval_table_stubs_media_until_native_support_exists(
     run.log({"media_eval": et})
 
     rows = mock_ces_client.eval_tables.rows.add.call_args.kwargs["rows"]
-    assert rows == [
-        {
-            "input": {"row": 1},
-            "output": {"image": "[wandb.Image not yet supported]"},
-            "scores": {},
-        }
-    ]
-    mock_wandb_log.assert_warned(
-        "wandb.Image values are not yet supported by CES EvalTable logging"
+    image_value = rows[0]["output"]["image"]
+    assert image_value["extension_type"] == "wandb-image"
+    assert image_value["uri"].startswith("wandb-run-file://")
+
+
+@pytest.mark.parametrize(
+    ("oversized_media_cells", "expected_metrics"),
+    [
+        (0, ["eval_table_ces_media_write"]),
+        (
+            1,
+            [
+                "eval_table_ces_media_write",
+                "eval_table_ces_media_write_with_oversized_cells",
+            ],
+        ),
+    ],
+)
+def test_ces_eval_table_media_telemetry_counts_affected_writes(
+    monkeypatch,
+    oversized_media_cells,
+    expected_metrics,
+):
+    recorder = MagicMock()
+    monkeypatch.setattr(ces, "get_telemetry_recorder", lambda: recorder)
+    prepared = ces._CESWritePayloads(
+        dataset_fields=[],
+        scorers=[],
+        row_batches=[],
+        media_cells_examined=1,
+        oversized_media_cells=oversized_media_cells,
+        oversized_locations=(),
     )
 
+    ces.CESWriter()._record_media_telemetry(prepared)
 
-def test_ces_eval_table_raises_for_media_in_raise_mode(mock_ces_client):
+    assert [
+        call.args[0] for call in recorder.increment_counter.call_args_list
+    ] == expected_metrics
+    recorder.log.assert_not_called()
+
+
+def test_ces_eval_table_writes_supported_media_in_raise_mode(mock_ces_client, run):
     from PIL import Image as PILImage
 
     image = wandb.Image(PILImage.new("RGB", (2, 2), color="red"))
 
-    with pytest.raises(TypeError, match="unsupported wandb media type 'Image'"):
-        wandb.EvalTable(
-            columns=["image"],
-            data=[[image]],
-            backend="ces",
-            unsupported_media_mode="raise",
-        )
+    table = wandb.EvalTable(
+        columns=["image"],
+        data=[[image]],
+        backend="ces",
+        unsupported_media_mode="raise",
+    )
+    run.log({"media_eval": table})
 
-    mock_ces_client.eval_tables.create.assert_not_called()
+    rows = mock_ces_client.eval_tables.rows.add.call_args.kwargs["rows"]
+    assert rows[0]["output"]["image"]["extension_type"] == "wandb-image"
 
 
 def test_ces_eval_table_batches_rows_by_encoded_bytes(
@@ -481,6 +548,17 @@ def test_ces_eval_table_rejects_mixed_types_with_permissive_dtype_before_network
     mock_ces_client.eval_tables.create.assert_not_called()
 
 
+def test_ces_eval_table_reports_extension_types_in_mixed_column_error():
+    writer = ces.CESWriter()
+
+    with pytest.raises(UsageError, match="mixes 'wandb-image' and 'wandb-audio'"):
+        writer._merge_field_type(
+            "media",
+            ces._CESFieldType("json", "wandb-image", 1),
+            ces._CESFieldType("json", "wandb-audio", 1),
+        )
+
+
 @pytest.mark.parametrize(
     (
         "columns",
@@ -568,17 +646,15 @@ def test_ces_error_uses_original_integer_column(mock_ces_client, run):
     mock_ces_client.eval_tables.create.assert_not_called()
 
 
-def test_ces_eval_table_requires_base_url(monkeypatch, mock_run):
+def test_ces_base_url(monkeypatch):
     monkeypatch.delenv("CES_BASE_URL", raising=False)
-    run = mock_run(settings={"entity": "e", "project": "p", "mode": "online"})
-    et = wandb.EvalTable(
-        columns=["value"],
-        data=[[1]],
-        backend="ces",
+    assert ces._ces_base_url("https://api.wandb.ai") == "https://evaluations.wandb.ai"
+    assert (
+        ces._ces_base_url("https://example.test") == "https://example.test/evaluations"
     )
 
-    with pytest.raises(UsageError, match="CES_BASE_URL"):
-        run.log({"eval": et})
+    monkeypatch.setenv("CES_BASE_URL", "https://ces.test")
+    assert ces._ces_base_url("https://api.wandb.ai") == "https://ces.test"
 
 
 def test_ces_eval_table_requires_client_before_scope_lookup(monkeypatch, run):
@@ -591,6 +667,7 @@ def test_ces_eval_table_requires_client_before_scope_lookup(monkeypatch, run):
     writer._bound = replace(
         writer._require_bound(),
         service_api=SimpleNamespace(
+            base_url="https://api.wandb.ai",
             api_key="secret",
             access_token=MagicMock(),
             execute_graphql=execute_graphql,
